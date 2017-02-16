@@ -1,0 +1,17 @@
+packages:
+  nfusr:
+    summary: userspace NFS client
+    packager: opensource@fb.com
+    requires:
+      - fb-glusterfs-clientstats >= 20170126-090930
+      - fb-sortinghat
+    static:
+      storage/gluster/nfusr/mount.nfusr-fb:
+        path: /sbin/mount.nfusr
+      storage/gluster/nfusr/umount.fuse.nfusr:
+        path: /sbin/umount.fuse.nfusr
+    rules:
+      buck:storage/gluster/nfusr:
+        storage/gluster/nfusr/nfusr:
+          path: bin/nfusr
+

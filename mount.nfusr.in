@@ -1,0 +1,57 @@
+#!/bin/bash
+
+# Copyright (c) 2016-present, Facebook, Inc.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree. An additional grant
+# of patent rights can be found in the PATENTS file in the same directory.
+
+NFUSR="@bindir@/nfusr"
+
+function usage() {
+   echo "Usage: $0 <host> <mountpoint> [-o mount-option[,mount-option...]]"
+   echo ""
+   echo "Where <host> is a set of NFS hosts, expressed as 'nfs://host/export[,nfs://host/export...]'."
+   exit 1
+}
+
+# Parse the 'host' command line argument, return a set of NFS hosts in $HOSTS global.
+function get_hosts () {
+    local HOST=$1
+    if [[ "$HOST" =~ ^nfs://.* ]]; then
+      HOSTS=$(echo "$HOST" | sed 's/,/ /g')
+    else
+      echo "Invalid host specifier: $HOST."
+      usage
+      return 1
+    fi
+
+    return 0
+}
+
+if [ $# -lt 2 ]; then
+  usage
+fi
+
+if ! get_hosts "$1"; then
+    exit 1
+fi
+
+mountpoint=$2
+shift 2
+
+mountopts=""
+while getopts "so:" opt; do
+    if [ "$opt" = "o" ]; then
+        for option in $(echo "$OPTARG" | sed 's/,/ /g'); do
+            mountopts="$mountopts,$option"
+        done
+    fi
+done
+
+if [ -n "$mountopts" ]; then
+    mountopts=$(echo "$mountopts" | sed 's/^,/-o /')
+fi
+
+$NFUSR $HOSTS $mountpoint $mountopts

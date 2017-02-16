@@ -1,0 +1,107 @@
+#!/bin/bash
+
+# Copyright (c) 2016-present, Facebook, Inc.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree. An additional grant
+# of patent rights can be found in the PATENTS file in the same directory.
+
+# Facebook specific mount script which integrates with internal infrastructure.
+
+NFUSR="/usr/local/bin/nfusr"
+
+function usage() {
+   echo "Usage: $0 <host> <mountpoint> [-o mount-option[,mount-option...]]"
+   echo ""
+   echo "Where <host> is either a single SMC tier, expressed as 'smc://tier/export', or"
+   echo "a set of NFS hosts, expressed as 'nfs://host/export[,nfs://host/export...]'."
+   exit 1
+}
+
+function falsey {
+  case $1 in
+    no|off|disable|false) return 0;;
+  esac
+  return 1
+}
+
+# Parse the 'host' command line argument, return a set of NFS hosts in $HOSTS global.
+#
+# Accepts either a comma seperated set of libnfs-style NFS URIs or a SMC tier.
+function get_hosts () {
+    local HOST=$1
+    if [[ "$HOST" =~ ^nfs://.* ]]; then
+      # Split on commas.
+      HOSTS=$(echo "$HOST" | tr "," "\n")
+    elif [[ "$HOST" =~ ^smc://.* ]]; then
+      U=${HOST#smc://}
+      TIER=${U%%/*}
+      EXPORT=${U#*/}
+      HOSTS=$(sortinghat-smc --ipv6c "$TIER" | sed 's%^%nfs://%' | sed "s%$%/${EXPORT}%")
+      if [ -z "$HOSTS" ]; then
+         echo "No enabled hosts found in SMC tier $TIER."
+         return 1
+      fi
+    else
+      echo "Invalid host specifier: $HOST."
+      usage
+      return 1
+    fi
+
+    return 0
+}
+
+if [ $# -lt 2 ]; then
+  usage
+fi
+
+if ! get_hosts "$1"; then
+    exit 1
+fi
+
+mountpoint=$2
+shift 2
+
+stats_logging=1
+mountopts=""
+while getopts "so:" opt; do
+    if [ "$opt" = "o" ]; then
+        for option in $(echo "$OPTARG" | sed 's/,/ /g'); do
+            key=$(echo "$option" | cut -f1 -d'=')
+            value=$(echo "$option" | cut -f2- -d'=')
+            case "$key" in
+                "stats-logging")
+                    if falsey "$value"; then
+                        stats_logging=
+                    fi
+                    ;;
+                *)
+                    mountopts="$mountopts,$option"
+                    ;;
+            esac
+        done
+    fi
+done
+
+if [ -n "$mountopts" ]; then
+    mountopts=$(echo "$mountopts" | sed 's/^,/-o /')
+fi
+
+if [ -n "$stats_logging" ]; then
+    squashed_mountpoint=$(echo "$mountpoint" | sed 's^/^_^g')
+    statsbase="${TMPDIR:-/tmp}/nfusr_client$squashed_mountpoint"
+    logfile="$statsbase.log"
+    statsfile="$statsbase.stats"
+    mountopts="--log-file=$logfile --stats-file=$statsfile $mountopts"
+
+    if [ -n "$TIER" ]; then
+        log_tier=$TIER
+    else
+        log_tier="unknown"
+    fi
+    gfs_clientstats_scuba "$logfile" gfs "$log_tier" &
+    gfs_clientstats_ods "$statsfile" &
+fi
+
+$NFUSR $HOSTS $mountpoint $mountopts

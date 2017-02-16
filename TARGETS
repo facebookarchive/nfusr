@@ -1,0 +1,26 @@
+cpp_binary(
+    name='nfusr',
+    headers=AutoHeaders.RECURSIVE_GLOB,  # https://fburl.com/424819295
+    srcs=[
+        'ClientStats.cpp',
+        'fuse_optype.cpp',
+        'logger.cpp',
+        'nfusr.cpp',
+        'NfsClient.cpp',
+        'NfsCachedClient.cpp',
+        'NfsConnection.cpp',
+        'NfsConnectionPool.cpp'
+    ],
+    external_deps=[
+        ('libnfs', None, 'nfs'),
+        ('fuse', None, 'fuse'),
+        ('glibc', None, 'dl'),
+    ],
+)
+
+custom_unittest(
+    name='gluster_integration_test',
+    command=['storage/gluster/nfusr/tests/integration_test_wrapper.sh'],
+    type='simple',
+    deps=[':nfusr'],
+)
