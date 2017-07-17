@@ -18,14 +18,27 @@ class NfsCachedClient : public NfsClient {
  public:
   NfsCachedClient(
       std::vector<std::string>& urls,
+      const char* hostscript,
+      const int script_refresh_seconds,
       size_t targetConnections,
+      int nfsTimeout,
       std::shared_ptr<nfusr::Logger> logger,
-      bool errorInjection)
-      : NfsClient(urls, targetConnections, logger, errorInjection) {
-  }
-  virtual ~NfsCachedClient();
+      std::shared_ptr<ClientStats> stats,
+      bool errorInjection,
+      NfsClientPermissionMode permMode)
+      : NfsClient(
+            urls,
+            hostscript,
+            script_refresh_seconds,
+            targetConnections,
+            nfsTimeout,
+            logger,
+            stats,
+            errorInjection,
+            permMode) {}
+  ~NfsCachedClient() override;
 
-  virtual void replyEntry(
+  void replyEntry(
       RpcContext* ctx,
       const nfs_fh3* fh,
       const struct fattr3* attr,
@@ -33,13 +46,13 @@ class NfsCachedClient : public NfsClient {
       std::shared_ptr<std::string> local_cache_path,
       const char* caller,
       fuse_ino_t parent,
-      const char* name);
-  virtual void read(
+      const char* name) override;
+  void read(
       fuse_req_t req,
       fuse_ino_t inode,
       size_t size,
       off_t off,
-      struct fuse_file_info* file);
+      struct fuse_file_info* file) override;
   std::unique_ptr<CacheBlock> readCache(
       std::shared_ptr<std::string> data_fname,
       size_t size,

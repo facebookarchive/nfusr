@@ -19,7 +19,10 @@
 namespace nfusr {
 
 Logger::Logger()
-    : fp_(nullptr), mask_(LOG_UPTO(LOG_WARNING)), mode_(stdout_mode) {}
+    : fp_(nullptr),
+      mask_(LOG_UPTO(LOG_NOTICE)),
+      mode_(stdout_mode),
+      autoFlush_(false) {}
 
 Logger::~Logger() {
   if (fp_) {
@@ -28,7 +31,7 @@ Logger::~Logger() {
   }
 }
 
-int Logger::openFile(const char* name, bool fifoMode) {
+int Logger::openFile(const char* name, bool fifoMode, bool autoFlush) {
   if (!::strcmp(name, "-")) {
     fp_ = stdout;
   } else {
@@ -54,6 +57,7 @@ int Logger::openFile(const char* name, bool fifoMode) {
       return errno;
     } else {
       mode_ = file_mode;
+      autoFlush_ = autoFlush;
     }
   }
 
@@ -113,35 +117,30 @@ void Logger::log_msg(
                 line,
                 func,
                 fmt) < 0) {
-            ::vfprintf(fp_, fmt, ap);
+          ::vfprintf(fp_, fmt, ap);
         } else {
-            ::vfprintf(fp_, fmtstr, ap);
+          ::vfprintf(fp_, fmtstr, ap);
+        }
+        if (autoFlush_) {
+          ::fflush(fp_);
         }
         break;
       case syslog_mode:
         if (::asprintf(
-                &fmtstr,
-                "[%s:%d:%s] nfusr-client: %s",
-                file,
-                line,
-                func,
-                fmt) < 0) {
-            ::vsyslog(log_level | LOG_DAEMON, fmt, ap);
+                &fmtstr, "[%s:%d:%s] nfusr-client: %s", file, line, func, fmt) <
+            0) {
+          ::vsyslog(log_level | LOG_DAEMON, fmt, ap);
         } else {
-            ::vsyslog(log_level | LOG_DAEMON, fmtstr, ap);
+          ::vsyslog(log_level | LOG_DAEMON, fmtstr, ap);
         }
         break;
       case stdout_mode:
         if (::asprintf(
-                &fmtstr,
-                "[%s:%d:%s] nfusr-client: %s",
-                file,
-                line,
-                func,
-                fmt) < 0) {
-            ::vprintf(fmt, ap);
+                &fmtstr, "[%s:%d:%s] nfusr-client: %s", file, line, func, fmt) <
+            0) {
+          ::vprintf(fmt, ap);
         } else {
-            ::vprintf(fmtstr, ap);
+          ::vprintf(fmtstr, ap);
         }
         break;
     }

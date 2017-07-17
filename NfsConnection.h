@@ -16,6 +16,7 @@
 #include <thread>
 
 #include "logger.h"
+#include "ClientStats.h"
 
 /// @brief NfsConnection represents an active connection to a NFS server.
 ///
@@ -23,7 +24,9 @@
 /// server.
 class NfsConnection {
  public:
-  explicit NfsConnection(std::shared_ptr<nfusr::Logger> logger);
+  NfsConnection(std::shared_ptr<nfusr::Logger> logger,
+                std::shared_ptr<ClientStats> stats,
+                int timeoutMs);
   ~NfsConnection();
 
   int open(std::shared_ptr<std::string> url);
@@ -48,12 +51,22 @@ class NfsConnection {
     return description_;
   }
 
+  bool closed() const {
+      return closed_;
+  }
+
+  int getQueuedRequests() {
+      std::unique_lock<std::mutex> guard(lock_);
+      return nfs_queue_length(ctx_);
+  }
+
  private:
   void ioLoop();
   int serviceConnection(int fd);
   int makeWakeable();
 
   std::shared_ptr<nfusr::Logger> logger_;
+  std::shared_ptr<ClientStats> stats_;
   std::shared_ptr<std::string> url_;
   std::mutex lock_;
   struct nfs_context* ctx_;
@@ -63,4 +76,5 @@ class NfsConnection {
   bool closed_;
   bool terminate_;
   std::string description_;
+  int timeoutMs_;
 };

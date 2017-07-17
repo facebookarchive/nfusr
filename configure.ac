@@ -14,7 +14,7 @@ AC_PROG_LN_S
 AX_CXX_COMPILE_STDCXX_14
 # Checks for libraries.
 AC_SEARCH_LIBS([fuse_mount], [fuse], [], AC_MSG_ERROR([required libfuse-dev not found]))
-AC_SEARCH_LIBS([nfs_init_context], [nfs], [], AC_MSG_ERROR([required libnfs-dev not found]))
+AC_SEARCH_LIBS([nfs_mkdir2], [nfs], [], AC_MSG_ERROR([required libnfs-dev >= 2.0 not found]))
 AC_SEARCH_LIBS([pthread_create], [pthread], [], AC_MSG_ERROR([required libpthread not found]))
 
 # Checks for header files.

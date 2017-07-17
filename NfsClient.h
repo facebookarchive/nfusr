@@ -14,7 +14,9 @@
 
 #include <errno.h>
 #include <atomic>
+#include <ctime>
 #include <mutex>
+#include <random>
 #include <set>
 #include <thread>
 #include <vector>
@@ -26,7 +28,20 @@
 #include "logger.h"
 
 class RpcContext;
+class RpcContextParentName;
+class RpcContextInode;
+class RpcContextInodeFile;
 class ReadRpcContext;
+class WriteRpcContext;
+class SetattrRpcContext;
+class AccessRpcContext;
+
+enum NfsClientPermissionMode {
+  InitialPerms, // always use initial permissions.
+  StrictPerms, // always use proper permissions.
+  SloppyPerms // use proper permissions when creating,
+              // use inital perms otherwise
+};
 
 /// @brief NfsClient implements fundamental FUSE operations on a pool of NFS
 /// servers.
@@ -34,14 +49,17 @@ class NfsClient {
  public:
   NfsClient(
       std::vector<std::string>& urls,
+      const char* hostscript,
+      const int scriptRefreshSeconds,
       size_t targetConnections,
+      int nfsTimeoutMs,
       std::shared_ptr<nfusr::Logger> logger,
-      bool errorInjection);
+      std::shared_ptr<ClientStats> stats,
+      bool errorInjection,
+      NfsClientPermissionMode permMode);
   virtual ~NfsClient();
 
-  bool start(
-      std::shared_ptr<std::string> cacheRoot
-  );
+  bool start(std::shared_ptr<std::string> cacheRoot);
   bool checkRpcCompletion(
       RpcContext* info,
       int rpc_status,
@@ -53,18 +71,15 @@ class NfsClient {
     return connPool_;
   }
   InodeInternal* inodeLookup(fuse_ino_t);
-  bool getErrorInjection() const {
-    return errorInjection_;
-  }
 
   std::shared_ptr<nfusr::Logger> getLogger() const {
     return logger_;
   }
 
-  int startStatsLogging(const char* fileName, const char *prefix = nullptr);
   bool statsEnabled() const {
     return stats_ != nullptr;
   }
+
   void recordOperationStats(
       enum fuse_optype optype,
       std::chrono::microseconds elapsed) {
@@ -73,10 +88,21 @@ class NfsClient {
     }
   }
 
-  static void stat_from_fattr3(
-      struct stat* st,
-      const struct fattr3*
-      attr);
+  void recordOperationIssue() {
+    if (stats_) {
+      stats_->recordIssue();
+    }
+  }
+
+  void recordRpcFailure(bool isTimeout) {
+    if (stats_) {
+      stats_->recordRpcFailure(isTimeout);
+    }
+  }
+
+  bool shouldRetry(int rpc_status, RpcContext* ctx);
+
+  static void stat_from_fattr3(struct stat* st, const struct fattr3* attr);
   virtual void replyEntry(
       RpcContext* ctx,
       const nfs_fh3* fh,
@@ -86,6 +112,7 @@ class NfsClient {
       const char* caller,
       fuse_ino_t parent,
       const char* name);
+  void getattrWithContext(RpcContextInodeFile* ctx);
   void getattr(fuse_req_t req, fuse_ino_t inode, struct fuse_file_info* file);
   void opendir(fuse_req_t req, fuse_ino_t inode, struct fuse_file_info* file);
   void readdir(
@@ -96,12 +123,14 @@ class NfsClient {
       struct fuse_file_info* file);
   void
   releasedir(fuse_req_t req, fuse_ino_t inode, struct fuse_file_info* file);
+  void lookupWithContext(RpcContextParentName* ctx);
   void lookup(fuse_req_t req, fuse_ino_t parent, const char* name);
   static void lookupCallback(
       struct rpc_context*,
       int rpc_status,
       void* data,
       void* private_data);
+  void openWithContext(RpcContextInodeFile* ctx);
   void open(fuse_req_t req, fuse_ino_t inode, struct fuse_file_info* file);
   void readWithContext(ReadRpcContext* ctx);
   virtual void read(
@@ -110,6 +139,7 @@ class NfsClient {
       size_t size,
       off_t off,
       struct fuse_file_info* file);
+  void writeWithContext(WriteRpcContext* ctx);
   void write(
       fuse_req_t req,
       fuse_ino_t inode,
@@ -142,6 +172,7 @@ class NfsClient {
       void* data,
       void* private_data);
   void mkdir(fuse_req_t req, fuse_ino_t parent, const char* name, mode_t mode);
+  void setattrWithContext(SetattrRpcContext* ctx);
   void setattr(
       fuse_req_t req,
       fuse_ino_t ino,
@@ -179,7 +210,9 @@ class NfsClient {
       const char* newname);
   void
   fsync(fuse_req_t req, fuse_ino_t inode, int datasync, fuse_file_info* file);
+  void statfsWithContext(RpcContextInode* ctx);
   void statfs(fuse_req_t req, fuse_ino_t inode);
+  void accessWithContext(AccessRpcContext* ctx);
   void access(fuse_req_t req, fuse_ino_t inode, int mask);
 
   uint64_t getMaxRead() {
@@ -190,12 +223,65 @@ class NfsClient {
     return logger_;
   }
 
+  /// @brief Initialize error injection system.
+  ///
+  /// @param min: minimum number of requests before injecting error.
+  /// @param max: max number of requests allowed before injecting error.
+  void initErrorInjection(uint32_t min = 50, uint32_t max = 100) {
+    assert(max > min);
+    eiMin_ = min;
+    eiMax_ = max;
+    eiCounter_ = 0;
+    eiRng_.seed(time(nullptr));
+  }
+
+  /// @brief Determine whether to inject error.
+  ///
+  /// If error injection is enabled, randomly returns true
+  /// on somewhere between eiMin and eiMax calls.
+  bool errorInjection() {
+    if (eiMin_) {
+      if (++eiCounter_ >= eiMin_) {
+        auto range = eiMax_ - eiMin_;
+
+        if (eiRng_() % range <= eiCounter_ - eiMin_) {
+          eiCounter_ = 0;
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  static void setAttrTimeout(double to) {
+    attrTimeout_ = to;
+  }
+
+  static double getAttrTimeout() {
+    return attrTimeout_;
+  }
+
  private:
+  void setUidGid(RpcContext const& ctx, bool creat);
+  void restoreUidGid(RpcContext const& ctx, bool creat);
+
   NfsConnectionPool connPool_;
   InodeInternal* rootInode_;
   uint64_t maxRead_;
   uint64_t maxWrite_;
   std::shared_ptr<nfusr::Logger> logger_;
-  bool errorInjection_;
-  std::unique_ptr<ClientStats> stats_;
+  std::shared_ptr<ClientStats> stats_;
+
+  static double attrTimeout_;
+
+  // Error injection contol.
+  uint32_t eiMin_;
+  uint32_t eiMax_;
+  uint32_t eiCounter_;
+  std::mt19937 eiRng_;
+
+  // UID/GID fun
+  NfsClientPermissionMode permMode_;
+  uid_t initial_uid_;
+  gid_t initial_gid_;
 };

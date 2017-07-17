@@ -33,7 +33,7 @@ class Logger {
   void printf(const char* fmt, ...)
       __attribute__((__format__(__printf__, 2, 3)));
 
-  int openFile(const char* name, bool fifoMode);
+  int openFile(const char* name, bool fifoMode, bool autoFlush);
   void setMask(int mask) {
     mask_ = mask;
   }
@@ -47,5 +47,6 @@ class Logger {
   FILE* fp_;
   int mask_;
   enum { stdout_mode, file_mode, syslog_mode } mode_;
+  bool autoFlush_;
 };
 };

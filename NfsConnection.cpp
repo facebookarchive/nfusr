@@ -9,20 +9,25 @@
 
 #include "NfsConnection.h"
 
-#include <cstring>
 #include <nfsc/libnfs-raw.h>
 #include <poll.h>
 #include <signal.h>
 #include <sys/signalfd.h>
-#include <sstream>
 #include <unistd.h>
+#include <cstring>
+#include <sstream>
 
-NfsConnection::NfsConnection(std::shared_ptr<nfusr::Logger> logger) {
+NfsConnection::NfsConnection(
+    std::shared_ptr<nfusr::Logger> logger,
+    std::shared_ptr<ClientStats> stats,
+    int timeoutMs) {
   logger_ = logger;
+  stats_ = stats;
   if ((ctx_ = nfs_init_context()) == nullptr) {
     logger_->LOG_MSG(LOG_ERR, "Cannot initialize NFS context.\n");
     throw std::runtime_error("Cannot initialize NFS context.");
   }
+  nfs_set_autoreconnect(ctx_, 0);
   wake_fd_ = -1;
   opened_ = false;
   closed_ = false;
@@ -30,6 +35,10 @@ NfsConnection::NfsConnection(std::shared_ptr<nfusr::Logger> logger) {
   std::stringstream description;
   description << (void*)this << "(closed)";
   description_ = description.str();
+
+  timeoutMs_ = timeoutMs > 0 ? timeoutMs : -1;
+
+  nfs_set_timeout(ctx_, timeoutMs_);
 }
 
 NfsConnection::~NfsConnection() {
@@ -38,6 +47,7 @@ NfsConnection::~NfsConnection() {
     assert(closed_);
   }
   if (ctx_ != nullptr) {
+    rpc_disconnect(nfs_get_rpc_context(ctx_), "~nfsConnection");
     nfs_destroy_context(ctx_);
   }
 }
@@ -48,16 +58,14 @@ int NfsConnection::makeWakeable() {
   sigaddset(&sigset, SIGUSR1);
 
   if (sigprocmask(SIG_BLOCK, &sigset, nullptr)) {
-      logger_->LOG_MSG(LOG_ERR, "sigprocmask() failed: %s.\n",
-              strerror(errno));
-      return -1;
+    logger_->LOG_MSG(LOG_ERR, "sigprocmask() failed: %s.\n", strerror(errno));
+    return -1;
   }
 
   wake_fd_ = signalfd(-1, &sigset, 0);
   if (wake_fd_ == -1) {
-      logger_->LOG_MSG(LOG_ERR, "signalfd() failed: %s.\n",
-              strerror(errno));
-      return -1;
+    logger_->LOG_MSG(LOG_ERR, "signalfd() failed: %s.\n", strerror(errno));
+    return -1;
   }
 
   return 0;
@@ -68,16 +76,16 @@ static void wakeThread(std::thread& t) {
 }
 
 void NfsConnection::put() {
-    if (nfs_which_events(ctx_) & POLLOUT) {
-        // We have some outgoing traffic. Try
-        // to send now while we hold the lock.
-        int rc = nfs_service(ctx_, POLLOUT);
-        if (rc || (nfs_which_events(ctx_) & POLLOUT)) {
-            // Can't send, wake main loop to retry.
-            wakeThread(ioLoop_);
-        }
+  if ((nfs_which_events(ctx_) & POLLOUT) && !closed_) {
+    // We have some outgoing traffic. Try
+    // to send now while we hold the lock.
+    int rc = nfs_service(ctx_, POLLOUT);
+    if (rc || (nfs_which_events(ctx_) & POLLOUT)) {
+      // Can't send, wake main loop to retry.
+      wakeThread(ioLoop_);
     }
-    lock_.unlock();
+  }
+  lock_.unlock();
 }
 
 int NfsConnection::serviceConnection(int fd) {
@@ -92,7 +100,7 @@ int NfsConnection::serviceConnection(int fd) {
   pfd[1].revents = 0;
 
   lock_.unlock();
-  rc = poll(pfd, 2, -1);
+  rc = poll(pfd, 2, timeoutMs_);
   lock_.lock();
 
   if (rc < 0) {
@@ -100,26 +108,28 @@ int NfsConnection::serviceConnection(int fd) {
     return rc;
   }
 
-  if (pfd[0].revents) {
-      rc = nfs_service(ctx_, pfd[0].revents & (POLLIN | POLLOUT));
+    rc = nfs_service(ctx_, pfd[0].revents & (POLLIN | POLLOUT));
 
-      if (rc < 0) {
-          logger_->LOG_MSG(LOG_INFO, "nfs_service() failed.\n");
-          return rc;
-      }
+    if (rc < 0) {
+      logger_->LOG_MSG(
+          LOG_INFO,
+          "nfs_service(%s) failed (%s).\n",
+          description_.c_str(),
+          nfs_get_error(ctx_));
+      return rc;
+    }
 
-      if (pfd[0].revents & (POLLERR | POLLHUP)) {
-          logger_->LOG_MSG(LOG_INFO, "Poll error.\n");
-          return -EIO;
-      }
-  }
+    if (pfd[0].revents & (POLLERR | POLLHUP)) {
+      logger_->LOG_MSG(LOG_INFO, "Poll error.\n");
+      return -EIO;
+    }
 
   if (pfd[1].revents) {
-      struct signalfd_siginfo info;
-      if (::read(wake_fd_, &info, sizeof(info)) != sizeof(info)) {
-          logger_->LOG_MSG(LOG_INFO, "read(wake_fd_) failed.\n");
-          return -EIO;
-      }
+    struct signalfd_siginfo info;
+    if (::read(wake_fd_, &info, sizeof(info)) != sizeof(info)) {
+      logger_->LOG_MSG(LOG_INFO, "read(wake_fd_) failed.\n");
+      return -EIO;
+    }
   }
 
   return 0;
@@ -141,6 +151,7 @@ void NfsConnection::ioLoop() {
     }
   }
 
+  closed_ = true;
   rpc_disconnect(nfs_get_rpc_context(ctx_), "nfsConnection::ioLoop");
 
   lock_.unlock();
@@ -171,7 +182,7 @@ int NfsConnection::open(std::shared_ptr<std::string> url) {
   nfs_destroy_url(parsed_url);
 
   std::stringstream description;
-  description << (void*)this << "(" << url << "/" << nfs_get_fd(ctx_) << ")";
+  description << (void*)this << "(" << *url << "/" << nfs_get_fd(ctx_) << ")";
   description_ = description.str();
 
   url_ = url;
@@ -188,15 +199,15 @@ int NfsConnection::close() {
   logger_->LOG_MSG(LOG_DEBUG, "%s(%s).\n", __func__, description_.c_str());
 
   terminate_ = true;
+  closed_ = true;
   wakeThread(ioLoop_);
   lock_.unlock();
 
   ioLoop_.join();
-  closed_ = true;
 
   if (wake_fd_ != -1) {
-      ::close(wake_fd_);
-      wake_fd_ = -1;
+    ::close(wake_fd_);
+    wake_fd_ = -1;
   }
 
   return 0;

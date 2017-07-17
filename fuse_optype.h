@@ -8,6 +8,8 @@
  */
 #pragma once
 
+#include <cstdint>
+
 /// @brief identifier for operation types.
 ///
 /// This is originally ripped from fuse_opcode type in kernel
@@ -61,3 +63,11 @@ enum fuse_optype {
 
 const unsigned num_fuse_optypes = FOPTYPE_RENAME2 + 1;
 const char *fuse_optype_name(enum fuse_optype);
+/// @brief get unique serial # from a fuse request.
+///
+/// fuse_req is deliberately opaque, so this is a gross hack
+/// to return the second 64-bit field in the req, which happens
+/// to be the serial #.
+inline uint64_t fuse_get_unique(const struct fuse_req* req) {
+    return ((const uint64_t *)req)[1];
+}

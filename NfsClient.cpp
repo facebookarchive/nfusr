@@ -8,18 +8,16 @@
  */
 
 #include "NfsClient.h"
-#include "logger.h"
 #include "RpcContext.h"
+#include "logger.h"
 
 #include <limits.h>
 #include <nfsc/libnfs.h>
 #include <cassert>
-#include <cstring>
 #include <chrono>
+#include <cstring>
 
-namespace {
-static const double attrTimeout = 0.0;
-}; // anonymous namespace
+double NfsClient::attrTimeout_ = 0.0;
 
 /// @brief translate a NFS fattr3 into struct stat.
 void NfsClient::stat_from_fattr3(struct stat* st, const struct fattr3* attr) {
@@ -76,7 +74,12 @@ void NfsClient::replyEntry(
     const char* caller = nullptr,
     fuse_ino_t parent = 0,
     const char* name = nullptr) {
-  auto ii = new InodeInternal(fh, local_cache_path);
+  InodeInternal* ii;
+  if (fh) {
+    ii = new InodeInternal(fh, local_cache_path);
+  } else {
+    ii = nullptr;
+  }
 
   if (caller && name) {
     ctx->getClient()->getLogger()->LOG_MSG(
@@ -92,8 +95,8 @@ void NfsClient::replyEntry(
   memset(&e, 0, sizeof(e));
   stat_from_fattr3(&e.attr, attr);
   e.ino = (fuse_ino_t)(uintptr_t)ii;
-  e.attr_timeout = attrTimeout;
-  e.entry_timeout = attrTimeout;
+  e.attr_timeout = attrTimeout_;
+  e.entry_timeout = attrTimeout_;
 
   if (file) {
     ctx->replyCreate(&e, file);
@@ -103,34 +106,55 @@ void NfsClient::replyEntry(
 }
 
 #define REPLY_ENTRY(fh, attr, file) \
-  ctx->getClient()->replyEntry(                       \
-      ctx, &(fh), &(attr), (file), nullptr, __func__, ctx->getParent(), \
+  ctx->getClient()->replyEntry(     \
+      ctx,                          \
+      &(fh),                        \
+      &(attr),                      \
+      (file),                       \
+      nullptr,                      \
+      __func__,                     \
+      ctx->getParent(),             \
       ctx->getName())
+
+// libnfs can return a null result pointer on RPC errors
+// (specifically timeouts). Convenience macro to extract
+// result value from a possibly NULL result pointer.
+#define RSTATUS(r) ((r) ? (r)->status : NFS3ERR_SERVERFAULT)
 
 NfsClient::NfsClient(
     std::vector<std::string>& urls,
+    const char* hostscript,
+    const int script_refresh_seconds,
     size_t targetConnections,
+    int nfsTimeoutMs,
     std::shared_ptr<nfusr::Logger> logger,
-    bool errorInjection)
-    : connPool_(urls, logger, std::min(urls.size(), targetConnections)),
+    std::shared_ptr<ClientStats> stats,
+    bool errorInjection,
+    NfsClientPermissionMode permMode)
+    : connPool_(
+          urls,
+          hostscript,
+          script_refresh_seconds,
+          logger,
+          stats,
+          std::min(urls.size(), targetConnections),
+          nfsTimeoutMs),
       logger_(logger),
-      errorInjection_(errorInjection),
-      stats_(nullptr)
-      {}
-
-NfsClient::~NfsClient() {
-    if (rootInode_) {
-        rootInode_->deref();
-    }
+      stats_(stats),
+      permMode_(permMode),
+      initial_uid_(getuid()),
+      initial_gid_(getgid()) {
+  if (errorInjection) {
+    initErrorInjection();
+  } else {
+    eiMin_ = eiMax_ = 0;
+  }
 }
 
-int NfsClient::startStatsLogging(const char *fileName, const char *prefix) {
-    stats_ = std::make_unique<ClientStats>();
-    if (stats_->start(fileName, prefix)) {
-        stats_ = nullptr;
-        return -1;
-    }
-    return 0;
+NfsClient::~NfsClient() {
+  if (rootInode_) {
+    rootInode_->deref();
+  }
 }
 
 /// @brief get the InodeInternal corresponding to a particular fuse_ino_t.
@@ -153,9 +177,7 @@ const struct nfs_fh3* nfs_get_rootfh(struct nfs_context* nfs);
 }
 
 /// @brief start a NFS connection and get some global state from the server.
-bool NfsClient::start(
-    std::shared_ptr<std::string> cacheRoot
-  ) {
+bool NfsClient::start(std::shared_ptr<std::string> cacheRoot) {
   auto conn = connPool_.get();
   if (conn) {
     auto nfs_ctx = conn->getNfsCtx();
@@ -167,24 +189,102 @@ bool NfsClient::start(
   return false;
 }
 
+/// @brief Test if an RPC operation should be retried.
+///
+/// If the operation failed to send and we actually have a connection
+/// to a server, retry.
+///
+/// This does *not* apply to RPCs that have been sent and need retry
+/// due to a failure on the server side. For that,
+/// see succeeded() in RpcContext.h
+///
+/// In case where no server connection is possible, completes the
+/// FUSE request in error.
+bool NfsClient::shouldRetry(int rpc_status, RpcContext* ctx) {
+  if (rpc_status != RPC_STATUS_SUCCESS) {
+    if (!ctx->hasConnection()) {
+      // We were unable to obtain any connection. We have
+      // tried all the possibilities, so this is non-retryable.
+      ctx->replyError(EHOSTUNREACH);
+      return false;
+    }
+
+    logger_->LOG_MSG(
+        LOG_WARNING,
+        "%s: RPC status %d (%ld).\n",
+        ctx->getConn()->describe().c_str(),
+        rpc_status,
+        fuse_get_unique(ctx->getReq()));
+    ctx->failConnection();
+    return true;
+  }
+
+  return false;
+}
+
+void NfsClient::setUidGid(RpcContext const& ctx, bool creat) {
+  switch (permMode_) {
+    case InitialPerms:
+      break;
+    case SloppyPerms:
+      if (creat && !ctx.isRetry()) {
+        auto rpcCtx = ctx.getRpcCtx();
+        auto fuseCtx = fuse_req_ctx(ctx.getReq());
+        rpc_set_uid(rpcCtx, fuseCtx->uid);
+        rpc_set_gid(rpcCtx, fuseCtx->gid);
+      }
+      break;
+    case StrictPerms: {
+      auto rpcCtx = ctx.getRpcCtx();
+      auto fuseCtx = fuse_req_ctx(ctx.getReq());
+      rpc_set_uid(rpcCtx, fuseCtx->uid);
+      rpc_set_gid(rpcCtx, fuseCtx->gid);
+    } break;
+  }
+}
+
+void NfsClient::restoreUidGid(RpcContext const& ctx, bool creat) {
+  switch (permMode_) {
+    case InitialPerms:
+      break;
+    case StrictPerms:
+      break;
+    case SloppyPerms:
+      if (creat) {
+        auto nfsCtx = ctx.getNfsCtx();
+        nfs_set_uid(nfsCtx, initial_uid_);
+        nfs_set_gid(nfsCtx, initial_gid_);
+      }
+      break;
+  }
+}
+
 /// Here starts FUSE operations.
 ///
 /// General structure of this code: every FUSE operation is implemented by a
-/// method with the same signature as FUSE (e.g. ::open) which maps to an
-/// async NFS operation.The initial method makes the NFS call
-/// (retrying with failover in case of error). All parameters to the call
-/// are stashed in a RpcContext object (specialized as necessary for the
-/// particular call) which libnfs will give us in the completion callback.
+/// public method with the same signature as FUSE (e.g. NfsClient::open).
+///
+/// These public methods allocate a RpcContext object to manage the
+/// lifetime of the FUSE request. All parameters to the call are stashed in
+/// the RpcContext object (which is specialized as necessary for the
+/// particular call; e.g. ReadRpcContext).
+///
+/// The public method now calls a ...WithContext method (e.g.
+/// NfsClient::openWithContext). This makes obtains a connection to a NFS
+/// server and issues an async call to libnfs, passing the RpcContext object
+/// as context (incidentally, this is why RpcContext instances are managed
+/// as raw pointers instead of smart pointers: for some of the instance
+/// lifetime, the only live reference is a pointer being held by libnfs).
 ///
 /// Operation resumes in the callback. In the event of failure, the callback
 /// may failover and re-call the original method on a new NFS connection
-/// (this is why RpcContext must include all the original parameters,
+/// (this is why the RpcContext must include all the original parameters,
 /// even if they're not useful in the success path).
 //
 /// In case of success the callback calls the proper fuse_reply* method
 /// and frees the RpcContext.
 ///
-/// So each implemented FUSE operation has three pieces of code:
+/// So each implemented FUSE operation has four three pieces of code:
 ///
 /// 1) (optional): the specialization of RpcContext for the set of
 ///    parameters accepted by the operation (there are some common
@@ -202,7 +302,12 @@ bool NfsClient::start(
 ///
 ///    Example: readCallback().
 ///
-/// 3) the operation itself. This has the same signature as the
+/// 3) the ..WithContext method, which issues the async NFS request, passing
+///    the callback and the context.
+///
+///    Example: readWithContext().
+///
+/// 4) the public interface. This has the same signature as the
 ///    corresponding FUSE operation. It allocates the RpcContext,
 ///    initiates the operation, and handles failover.
 ///
@@ -217,15 +322,32 @@ static void getattrCallback(
   auto res = (GETATTR3res*)data;
   bool retry;
 
-  if (ctx->succeeded(rpc_status, res->status, retry)) {
+  if (ctx->succeeded(rpc_status, RSTATUS(res), retry)) {
     struct stat st;
     ctx->getClient()->stat_from_fattr3(
         &st, &res->GETATTR3res_u.resok.obj_attributes);
-    ctx->replyAttr(&st, attrTimeout);
+    ctx->replyAttr(&st, NfsClient::getAttrTimeout());
   } else if (retry) {
-    ctx->getClient()->getattr(ctx->getReq(), ctx->getInode(), ctx->getFile());
-    delete ctx;
+    ctx->getClient()->getattrWithContext(ctx);
   }
+}
+
+void NfsClient::getattrWithContext(RpcContextInodeFile* ctx) {
+  int rpc_status = RPC_STATUS_ERROR;
+  auto inode = ctx->getInode();
+  do {
+    struct GETATTR3args args;
+    ::memset(&args, 0, sizeof(args));
+    args.object = inodeLookup(inode)->getFh();
+
+    if (ctx->obtainConnection()) {
+      setUidGid(*ctx, false);
+      rpc_status =
+          rpc_nfs3_getattr_async(ctx->getRpcCtx(), getattrCallback, &args, ctx);
+      restoreUidGid(*ctx, false);
+      ctx->unlockConnection();
+    }
+  } while (shouldRetry(rpc_status, ctx));
 }
 
 void NfsClient::getattr(
@@ -233,19 +355,7 @@ void NfsClient::getattr(
     fuse_ino_t inode,
     struct fuse_file_info* file) {
   auto ctx = new RpcContextInodeFile(this, req, FOPTYPE_GETATTR, inode, file);
-  int rpc_status = RPC_STATUS_ERROR;
-
-  do {
-    struct GETATTR3args args;
-    ::memset(&args, 0, sizeof(args));
-    args.object = inodeLookup(inode)->getFh();
-
-    if (ctx->obtainConnection()) {
-      rpc_status =
-          rpc_nfs3_getattr_async(ctx->getRpcCtx(), getattrCallback, &args, ctx);
-      ctx->unlockConnection();
-    }
-  } while (ctx->shouldRetryCall(rpc_status));
+  getattrWithContext(ctx);
 }
 
 namespace {
@@ -307,7 +417,7 @@ class OpendirRpcContext : public RpcContextInodeFile {
     ii_->ref();
   }
 
-  virtual ~OpendirRpcContext() {
+  ~OpendirRpcContext() override {
     ii_->deref(getClient()->getLogger().get(), __func__);
   }
 
@@ -350,7 +460,7 @@ static void opendirCallback(
   auto res = (READDIRPLUS3res*)data;
   bool retry;
 
-  if (ctx->succeeded(rpc_status, res->status, retry)) {
+  if (ctx->succeeded(rpc_status, RSTATUS(res), retry)) {
     struct entryplus3* entry = res->READDIRPLUS3res_u.resok.reply.entries;
     while (entry) {
       auto newEntrySize =
@@ -358,9 +468,12 @@ static void opendirCallback(
       auto fuseEntry = ctx->getFuseDirBuf().grow(newEntrySize);
       struct stat st;
 
-      assert(entry->name_attributes.attributes_follow);
-      ctx->getClient()->stat_from_fattr3(
-          &st, &entry->name_attributes.post_op_attr_u.attributes);
+     if (entry->name_attributes.attributes_follow) {
+       ctx->getClient()->stat_from_fattr3(
+           &st, &entry->name_attributes.post_op_attr_u.attributes);
+     } else {
+         ::memset(&st, 0, sizeof(st));
+     }
 
       fuse_add_direntry(
           ctx->getReq(),
@@ -386,13 +499,13 @@ static void opendirCallback(
       ctx->replyOpen(ctx->getFile());
     }
   } else if (retry) {
-    ctx->getClient()->opendir(ctx->getReq(), ctx->getInode(), ctx->getFile());
-    delete ctx;
+    opendirContinue(ctx, false);
   }
 }
 
 static void opendirContinue(OpendirRpcContext* ctx, bool have_connection) {
   int rpc_status = RPC_STATUS_ERROR;
+  auto client = ctx->getClient();
 
   do {
     struct READDIRPLUS3args args;
@@ -412,7 +525,7 @@ static void opendirContinue(OpendirRpcContext* ctx, bool have_connection) {
         have_connection = false;
       }
     }
-  } while (ctx->shouldRetryCall(rpc_status));
+  } while (client->shouldRetry(rpc_status, ctx));
 }
 
 void NfsClient::opendir(
@@ -434,8 +547,10 @@ void NfsClient::readdir(
 
   if ((size_t)off < buff->getSize()) {
     const size_t toSend = std::min(buff->getSize() - off, size);
+    logger_->LOG_MSG(LOG_DEBUG, "%s(%lu)\n", __func__, fuse_get_unique(req));
     fuse_reply_buf(req, buff->getBuffer() + off, toSend);
   } else {
+    logger_->LOG_MSG(LOG_DEBUG, "%s(%lu)\n", __func__, fuse_get_unique(req));
     fuse_reply_buf(req, nullptr, 0);
   }
 }
@@ -447,6 +562,7 @@ void NfsClient::releasedir(
   auto buff = (FuseDirBuffer*)(uintptr_t)file->fh;
   file->fh = 0;
   delete buff;
+  logger_->LOG_MSG(LOG_DEBUG, "%s(%lu)\n", __func__, fuse_get_unique(req));
   fuse_reply_err(req, 0);
 }
 
@@ -459,7 +575,28 @@ void NfsClient::lookupCallback(
   auto res = (LOOKUP3res*)data;
   bool retry;
 
-  if (ctx->succeeded(rpc_status, res->status, retry)) {
+  if (rpc_status == RPC_STATUS_SUCCESS && RSTATUS(res) == NFS3ERR_NOENT) {
+    // Magic special case for fuse: if we want negative cache, we
+    // must not return ENOENT, must instead return success with zero inode.
+    //
+    // See comments in definition of fuse_entry_param in fuse header.
+    struct fattr3 dummyAttr;
+    ::memset(&dummyAttr, 0, sizeof(dummyAttr));
+    ctx->getClient()->getLogger()->LOG_MSG(
+        LOG_DEBUG,
+        "Negative caching failed lookup req (%lu).\n",
+        fuse_get_unique(ctx->getReq()));
+    ctx->getClient()->replyEntry(
+        ctx,
+        nullptr /* fh */,
+        // &res->LOOKUP3res_u.resok.obj_attributes.post_op_attr_u.attributes,
+        &dummyAttr,
+        nullptr, /* file */
+        nullptr, /* local_cache_path */
+        __func__,
+        ctx->getParent(),
+        ctx->getName());
+  } else if (ctx->succeeded(rpc_status, RSTATUS(res), retry)) {
     assert(res->LOOKUP3res_u.resok.obj_attributes.attributes_follow);
 
     REPLY_ENTRY(
@@ -467,15 +604,13 @@ void NfsClient::lookupCallback(
         res->LOOKUP3res_u.resok.obj_attributes.post_op_attr_u.attributes,
         nullptr);
   } else if (retry) {
-    ctx->getClient()->lookup(ctx->getReq(), ctx->getParent(), ctx->getName());
-    delete ctx;
+    ctx->getClient()->lookupWithContext(ctx);
   }
 }
 
-void NfsClient::lookup(fuse_req_t req, fuse_ino_t parent, const char* name) {
-  auto ctx = new RpcContextParentName(this, req, FOPTYPE_LOOKUP, parent, name);
+void NfsClient::lookupWithContext(RpcContextParentName* ctx) {
   int rpc_status = RPC_STATUS_ERROR;
-
+  auto parent = ctx->getParent();
   do {
     LOOKUP3args args;
     ::memset(&args, 0, sizeof(args));
@@ -483,11 +618,18 @@ void NfsClient::lookup(fuse_req_t req, fuse_ino_t parent, const char* name) {
     args.what.name = (char*)ctx->getName();
 
     if (ctx->obtainConnection()) {
+      setUidGid(*ctx, false);
       rpc_status = rpc_nfs3_lookup_async(
           ctx->getRpcCtx(), this->lookupCallback, &args, ctx);
+      restoreUidGid(*ctx, false);
       ctx->unlockConnection();
     }
-  } while (ctx->shouldRetryCall(rpc_status));
+  } while (shouldRetry(rpc_status, ctx));
+}
+
+void NfsClient::lookup(fuse_req_t req, fuse_ino_t parent, const char* name) {
+  auto ctx = new RpcContextParentName(this, req, FOPTYPE_LOOKUP, parent, name);
+  lookupWithContext(ctx);
 }
 
 void NfsClient::forget(
@@ -498,6 +640,7 @@ void NfsClient::forget(
   while (nlookup--) {
     ii->deref(logger_.get(), __func__);
   }
+  logger_->LOG_MSG(LOG_DEBUG, "%s(%lu)\n", __func__, fuse_get_unique(req));
   fuse_reply_none(req);
 }
 
@@ -511,7 +654,7 @@ static void openCallback(
   auto res = (ACCESS3res*)data;
   bool retry;
 
-  if (ctx->succeeded(rpc_status, res->status, retry)) {
+  if (ctx->succeeded(rpc_status, RSTATUS(res), retry)) {
     auto file = ctx->getFile();
     file->fh = ctx->getInode();
     file->direct_io = 0;
@@ -520,18 +663,14 @@ static void openCallback(
 
     ctx->replyOpen(file);
   } else if (retry) {
-    client->open(ctx->getReq(), ctx->getInode(), ctx->getFile());
-    delete ctx;
+    client->openWithContext(ctx);
   }
 }
 
-void NfsClient::open(
-    fuse_req_t req,
-    fuse_ino_t inode,
-    struct fuse_file_info* file) {
-  auto ctx = new RpcContextInodeFile(this, req, FOPTYPE_OPEN, inode, file);
+void NfsClient::openWithContext(RpcContextInodeFile* ctx) {
   int rpc_status = RPC_STATUS_ERROR;
-
+  auto inode = ctx->getInode();
+  auto file = ctx->getFile();
   do {
     ACCESS3args args;
 
@@ -546,11 +685,21 @@ void NfsClient::open(
     }
 
     if (ctx->obtainConnection()) {
+      setUidGid(*ctx, false);
       rpc_status =
           rpc_nfs3_access_async(ctx->getRpcCtx(), openCallback, &args, ctx);
+      restoreUidGid(*ctx, false);
       ctx->unlockConnection();
     }
-  } while (ctx->shouldRetryCall(rpc_status));
+  } while (shouldRetry(rpc_status, ctx));
+}
+
+void NfsClient::open(
+    fuse_req_t req,
+    fuse_ino_t inode,
+    struct fuse_file_info* file) {
+  auto ctx = new RpcContextInodeFile(this, req, FOPTYPE_OPEN, inode, file);
+  openWithContext(ctx);
 }
 
 void NfsClient::release(
@@ -562,7 +711,6 @@ void NfsClient::release(
   fsync(req, inode, 0, file);
 }
 
-
 static void readCallback(
     struct rpc_context* /* rpc */,
     int rpc_status,
@@ -572,22 +720,15 @@ static void readCallback(
   auto res = (READ3res*)data;
   bool retry;
 
-  if (ctx->succeeded(rpc_status, res->status, retry)) {
+  if (ctx->succeeded(rpc_status, RSTATUS(res), retry)) {
     ctx->replyBuf(
         res->READ3res_u.resok.data.data_val, res->READ3res_u.resok.count);
   } else if (retry) {
-    ctx->getClient()->read(
-        ctx->getReq(),
-        ctx->getInode(),
-        ctx->getSize(),
-        ctx->getOff(),
-        ctx->getFile());
-    delete ctx;
+    ctx->getClient()->readWithContext(ctx);
   }
 }
 
-void NfsClient::readWithContext(
-    ReadRpcContext* ctx) {
+void NfsClient::readWithContext(ReadRpcContext* ctx) {
   int rpc_status = RPC_STATUS_ERROR;
 
   // Since FUSE chops reads into 128K chunks we'll never need to
@@ -605,11 +746,13 @@ void NfsClient::readWithContext(
     args.count = size;
 
     if (ctx->obtainConnection()) {
+      setUidGid(*ctx, false);
       rpc_status =
           rpc_nfs3_read_async(ctx->getRpcCtx(), readCallback, &args, ctx);
+      restoreUidGid(*ctx, false);
       ctx->unlockConnection();
     }
-  } while (ctx->shouldRetryCall(rpc_status));
+  } while (shouldRetry(rpc_status, ctx));
 }
 
 void NfsClient::read(
@@ -620,10 +763,9 @@ void NfsClient::read(
     struct fuse_file_info* file) {
   auto ctx =
       new ReadRpcContext(this, req, FOPTYPE_READ, inode, file, size, off);
-  this->readWithContext(ctx);
+  readWithContext(ctx);
 }
 
-namespace {
 class WriteRpcContext : public RpcContextInodeFile {
  public:
   WriteRpcContext(
@@ -655,7 +797,6 @@ class WriteRpcContext : public RpcContextInodeFile {
   off_t off_;
   const char* buf_;
 };
-} // anonymous namespace
 
 static void writeCallback(
     struct rpc_context* /* rpc */,
@@ -666,33 +807,23 @@ static void writeCallback(
   auto res = (WRITE3res*)data;
   bool retry;
 
-  if (ctx->succeeded(rpc_status, res->status, retry)) {
+  if (ctx->succeeded(rpc_status, RSTATUS(res), retry)) {
     ctx->replyWrite(res->WRITE3res_u.resok.count);
   } else if (retry) {
-    ctx->getClient()->write(
-        ctx->getReq(),
-        ctx->getInode(),
-        ctx->getBuf(),
-        ctx->getSize(),
-        ctx->getOff(),
-        ctx->getFile());
-    delete ctx;
+    ctx->getClient()->writeWithContext(ctx);
   }
 }
 
-void NfsClient::write(
-    fuse_req_t req,
-    fuse_ino_t inode,
-    const char* buf,
-    size_t size,
-    off_t off,
-    struct fuse_file_info* file) {
-  auto ctx = new WriteRpcContext(
-      this, req, FOPTYPE_WRITE, inode, file, size, off, buf);
+void NfsClient::writeWithContext(WriteRpcContext* ctx) {
   int rpc_status = RPC_STATUS_ERROR;
 
   // Since FUSE chops writes into 128K chunks we'll never need to
   // do this for any server which has maxWrite >= 128K.
+  auto inode = ctx->getInode();
+  auto off = ctx->getOff();
+  auto size = ctx->getSize();
+  auto file = ctx->getFile();
+  auto buf = ctx->getBuf();
   assert(size <= maxWrite_);
   do {
     WRITE3args args;
@@ -705,11 +836,25 @@ void NfsClient::write(
     args.data.data_val = (char*)buf;
 
     if (ctx->obtainConnection()) {
+      setUidGid(*ctx, false);
       rpc_status =
           rpc_nfs3_write_async(ctx->getRpcCtx(), writeCallback, &args, ctx);
+      restoreUidGid(*ctx, false);
       ctx->unlockConnection();
     }
-  } while (ctx->shouldRetryCall(rpc_status));
+  } while (shouldRetry(rpc_status, ctx));
+}
+
+void NfsClient::write(
+    fuse_req_t req,
+    fuse_ino_t inode,
+    const char* buf,
+    size_t size,
+    off_t off,
+    struct fuse_file_info* file) {
+  auto ctx = new WriteRpcContext(
+      this, req, FOPTYPE_WRITE, inode, file, size, off, buf);
+  writeWithContext(ctx);
 }
 
 namespace {
@@ -755,7 +900,7 @@ void NfsClient::createCallback(
   auto res = (CREATE3res*)data;
   bool retry;
 
-  if (ctx->succeeded(rpc_status, res->status, retry)) {
+  if (ctx->succeeded(rpc_status, RSTATUS(res), retry, false)) {
     assert(
         res->CREATE3res_u.resok.obj.handle_follows &&
         res->CREATE3res_u.resok.obj_attributes.attributes_follow);
@@ -794,11 +939,13 @@ void NfsClient::create(
     args.how.createhow3_u.obj_attributes.mode.set_mode3_u.mode = mode;
 
     if (ctx->obtainConnection()) {
+      setUidGid(*ctx, true);
       rpc_status = rpc_nfs3_create_async(
           ctx->getRpcCtx(), this->createCallback, &args, ctx);
+      restoreUidGid(*ctx, true);
       ctx->unlockConnection();
     }
-  } while (ctx->shouldRetryCall(rpc_status));
+  } while (shouldRetry(rpc_status, ctx));
 }
 
 static void unlinkCallback(
@@ -810,7 +957,7 @@ static void unlinkCallback(
   auto res = (REMOVE3res*)data;
   bool retry;
 
-  if (ctx->succeeded(rpc_status, res->status, retry)) {
+  if (ctx->succeeded(rpc_status, RSTATUS(res), retry, false)) {
     ctx->replyError(0);
   } else if (retry) {
     ctx->getClient()->unlink(ctx->getReq(), ctx->getParent(), ctx->getName());
@@ -829,14 +976,20 @@ void NfsClient::unlink(fuse_req_t req, fuse_ino_t parent, const char* name) {
     args.object.name = (char*)ctx->getName();
 
     if (ctx->obtainConnection()) {
+      logger_->LOG_MSG(
+          LOG_INFO,
+          "unlink: mode %d uid %d.\n",
+          permMode_,
+          fuse_req_ctx(req)->uid);
+      setUidGid(*ctx, false);
       rpc_status =
           rpc_nfs3_remove_async(ctx->getRpcCtx(), unlinkCallback, &args, ctx);
+      restoreUidGid(*ctx, false);
       ctx->unlockConnection();
     }
-  } while (ctx->shouldRetryCall(rpc_status));
+  } while (shouldRetry(rpc_status, ctx));
 }
 
-namespace {
 class SetattrRpcContext : public RpcContextInodeFile {
  public:
   SetattrRpcContext(
@@ -863,7 +1016,6 @@ class SetattrRpcContext : public RpcContextInodeFile {
   struct stat* attr_;
   int valid_;
 };
-} // anonymous namespace
 
 static void setattrCallback(
     struct rpc_context* /* rpc */,
@@ -874,33 +1026,22 @@ static void setattrCallback(
   auto res = (SETATTR3res*)data;
   bool retry;
 
-  if (ctx->succeeded(rpc_status, res->status, retry)) {
+  if (ctx->succeeded(rpc_status, RSTATUS(res), retry)) {
     assert(res->SETATTR3res_u.resok.obj_wcc.after.attributes_follow);
     struct stat st;
     ctx->getClient()->stat_from_fattr3(
         &st, &res->SETATTR3res_u.resok.obj_wcc.after.post_op_attr_u.attributes);
-    ctx->replyAttr(&st, attrTimeout);
+    ctx->replyAttr(&st, NfsClient::getAttrTimeout());
   } else if (retry) {
-    ctx->getClient()->setattr(
-        ctx->getReq(),
-        ctx->getInode(),
-        ctx->getAttr(),
-        ctx->getValid(),
-        ctx->getFile());
-    delete ctx;
+    ctx->getClient()->setattrWithContext(ctx);
   }
 }
 
-void NfsClient::setattr(
-    fuse_req_t req,
-    fuse_ino_t inode,
-    struct stat* attr,
-    int valid,
-    struct fuse_file_info* file) {
-  auto ctx = new SetattrRpcContext(
-      this, req, FOPTYPE_SETATTR, inode, attr, valid, file);
+void NfsClient::setattrWithContext(SetattrRpcContext* ctx) {
   int rpc_status = RPC_STATUS_ERROR;
-
+  auto inode = ctx->getInode();
+  auto attr = ctx->getAttr();
+  auto valid = ctx->getValid();
   do {
     SETATTR3args args;
     ::memset(&args, 0, sizeof(args));
@@ -971,11 +1112,24 @@ void NfsClient::setattr(
     }
 
     if (ctx->obtainConnection()) {
+      setUidGid(*ctx, false);
       rpc_status =
           rpc_nfs3_setattr_async(ctx->getRpcCtx(), setattrCallback, &args, ctx);
+      restoreUidGid(*ctx, false);
       ctx->unlockConnection();
     }
-  } while (ctx->shouldRetryCall(rpc_status));
+  } while (shouldRetry(rpc_status, ctx));
+}
+
+void NfsClient::setattr(
+    fuse_req_t req,
+    fuse_ino_t inode,
+    struct stat* attr,
+    int valid,
+    struct fuse_file_info* file) {
+  auto ctx = new SetattrRpcContext(
+      this, req, FOPTYPE_SETATTR, inode, attr, valid, file);
+  setattrWithContext(ctx);
 }
 
 namespace {
@@ -1009,7 +1163,7 @@ void NfsClient::mkdirCallback(
   auto res = (MKDIR3res*)data;
   bool retry;
 
-  if (ctx->succeeded(rpc_status, res->status, retry)) {
+  if (ctx->succeeded(rpc_status, RSTATUS(res), retry, false)) {
     assert(
         res->MKDIR3res_u.resok.obj.handle_follows &&
         res->MKDIR3res_u.resok.obj_attributes.attributes_follow);
@@ -1042,11 +1196,13 @@ void NfsClient::mkdir(
     args.attributes.mode.set_mode3_u.mode = mode;
 
     if (ctx->obtainConnection()) {
+      setUidGid(*ctx, true);
       rpc_status = rpc_nfs3_mkdir_async(
           ctx->getRpcCtx(), this->mkdirCallback, &args, ctx);
+      restoreUidGid(*ctx, true);
       ctx->unlockConnection();
     }
-  } while (ctx->shouldRetryCall(rpc_status));
+  } while (shouldRetry(rpc_status, ctx));
 }
 
 static void rmdirCallback(
@@ -1058,7 +1214,7 @@ static void rmdirCallback(
   auto res = (RMDIR3res*)data;
   bool retry;
 
-  if (ctx->succeeded(rpc_status, res->status, retry)) {
+  if (ctx->succeeded(rpc_status, RSTATUS(res), retry, false)) {
     ctx->replyError(0);
   } else if (retry) {
     ctx->getClient()->rmdir(ctx->getReq(), ctx->getParent(), ctx->getName());
@@ -1077,11 +1233,13 @@ void NfsClient::rmdir(fuse_req_t req, fuse_ino_t parent, const char* name) {
     args.object.name = (char*)ctx->getName();
 
     if (ctx->obtainConnection()) {
+      setUidGid(*ctx, false);
       rpc_status =
           rpc_nfs3_rmdir_async(ctx->getRpcCtx(), rmdirCallback, &args, ctx);
+      restoreUidGid(*ctx, false);
       ctx->unlockConnection();
     }
-  } while (ctx->shouldRetryCall(rpc_status));
+  } while (shouldRetry(rpc_status, ctx));
 }
 
 namespace {
@@ -1098,7 +1256,7 @@ class SymlinkRpcContext : public RpcContextParentName {
     link_ = ::strdup(link);
   }
 
-  virtual ~SymlinkRpcContext() {
+  ~SymlinkRpcContext() override {
     ::free((void*)link_);
   }
 
@@ -1120,7 +1278,7 @@ void NfsClient::symlinkCallback(
   auto res = (SYMLINK3res*)data;
   bool retry;
 
-  if (ctx->succeeded(rpc_status, res->status, retry)) {
+  if (ctx->succeeded(rpc_status, RSTATUS(res), retry, false)) {
     assert(
         res->SYMLINK3res_u.resok.obj.handle_follows &&
         res->SYMLINK3res_u.resok.obj_attributes.attributes_follow);
@@ -1155,11 +1313,13 @@ void NfsClient::symlink(
         S_IXUSR | S_IRGRP | S_IWGRP | S_IXGRP | S_IROTH | S_IWOTH | S_IXOTH;
 
     if (ctx->obtainConnection()) {
+      setUidGid(*ctx, true);
       rpc_status = rpc_nfs3_symlink_async(
           ctx->getRpcCtx(), this->symlinkCallback, &args, ctx);
+      restoreUidGid(*ctx, true);
       ctx->unlockConnection();
     }
-  } while (ctx->shouldRetryCall(rpc_status));
+  } while (shouldRetry(rpc_status, ctx));
 }
 
 static void readlinkCallback(
@@ -1171,7 +1331,7 @@ static void readlinkCallback(
   auto res = (READLINK3res*)data;
   bool retry;
 
-  if (ctx->succeeded(rpc_status, res->status, retry)) {
+  if (ctx->succeeded(rpc_status, RSTATUS(res), retry)) {
     ctx->replyReadlink(res->READLINK3res_u.resok.data);
   } else if (retry) {
     ctx->getClient()->readlink(ctx->getReq(), ctx->getInode());
@@ -1189,11 +1349,13 @@ void NfsClient::readlink(fuse_req_t req, fuse_ino_t inode) {
     args.symlink = inodeLookup(inode)->getFh();
 
     if (ctx->obtainConnection()) {
+      setUidGid(*ctx, false);
       rpc_status = rpc_nfs3_readlink_async(
           ctx->getRpcCtx(), readlinkCallback, &args, ctx);
+      restoreUidGid(*ctx, false);
       ctx->unlockConnection();
     }
-  } while (ctx->shouldRetryCall(rpc_status));
+  } while (shouldRetry(rpc_status, ctx));
 }
 
 namespace {
@@ -1212,7 +1374,7 @@ class RenameRpcContext : public RpcContextParentName {
     newname_ = ::strdup(newname);
   }
 
-  virtual ~RenameRpcContext() {
+  ~RenameRpcContext() override {
     ::free((void*)newname_);
   }
 
@@ -1238,7 +1400,7 @@ static void renameCallback(
   auto res = (RENAME3res*)data;
   bool retry;
 
-  if (ctx->succeeded(rpc_status, res->status, retry)) {
+  if (ctx->succeeded(rpc_status, RSTATUS(res), retry, false)) {
     ctx->replyError(0);
   } else if (retry) {
     ctx->getClient()->rename(
@@ -1270,11 +1432,13 @@ void NfsClient::rename(
     args.to.name = (char*)ctx->getNewName();
 
     if (ctx->obtainConnection()) {
+      setUidGid(*ctx, false);
       rpc_status =
           rpc_nfs3_rename_async(ctx->getRpcCtx(), renameCallback, &args, ctx);
+      restoreUidGid(*ctx, false);
       ctx->unlockConnection();
     }
-  } while (ctx->shouldRetryCall(rpc_status));
+  } while (shouldRetry(rpc_status, ctx));
 }
 
 namespace {
@@ -1310,7 +1474,7 @@ void NfsClient::linkCallback(
   auto res = (LINK3res*)data;
   bool retry;
 
-  if (ctx->succeeded(rpc_status, res->status, retry)) {
+  if (ctx->succeeded(rpc_status, RSTATUS(res), retry, false)) {
     assert(res->LINK3res_u.resok.file_attributes.attributes_follow);
     auto fh = client->inodeLookup(ctx->getInode())->getFh();
     REPLY_ENTRY(
@@ -1341,11 +1505,13 @@ void NfsClient::link(
     args.link.name = (char*)ctx->getName();
 
     if (ctx->obtainConnection()) {
+      setUidGid(*ctx, false);
       rpc_status =
           rpc_nfs3_link_async(ctx->getRpcCtx(), this->linkCallback, &args, ctx);
+      restoreUidGid(*ctx, false);
       ctx->unlockConnection();
     }
-  } while (ctx->shouldRetryCall(rpc_status));
+  } while (shouldRetry(rpc_status, ctx));
 }
 
 namespace {
@@ -1380,7 +1546,7 @@ static void fsyncCallback(
   auto res = (COMMIT3res*)data;
   bool retry;
 
-  if (ctx->succeeded(rpc_status, res->status, retry)) {
+  if (ctx->succeeded(rpc_status, RSTATUS(res), retry)) {
     ctx->replyError(0);
   } else if (retry) {
     ctx->getClient()->fsync(
@@ -1404,11 +1570,13 @@ void NfsClient::fsync(
     args.file = inodeLookup(inode)->getFh();
 
     if (ctx->obtainConnection()) {
+      setUidGid(*ctx, false);
       rpc_status =
           rpc_nfs3_commit_async(ctx->getRpcCtx(), fsyncCallback, &args, ctx);
+      restoreUidGid(*ctx, false);
       ctx->unlockConnection();
     }
-  } while (ctx->shouldRetryCall(rpc_status));
+  } while (shouldRetry(rpc_status, ctx));
 }
 
 static void statfsCallback(
@@ -1420,7 +1588,7 @@ static void statfsCallback(
   auto res = (FSSTAT3res*)data;
   bool retry;
 
-  if (ctx->succeeded(rpc_status, res->status, retry)) {
+  if (ctx->succeeded(rpc_status, RSTATUS(res), retry)) {
     struct statvfs st;
     ::memset(&st, 0, sizeof(st));
     st.f_bsize = NFS_BLKSIZE;
@@ -1438,29 +1606,33 @@ static void statfsCallback(
 
     ctx->replyStatfs(&st);
   } else if (retry) {
-    ctx->getClient()->statfs(ctx->getReq(), ctx->getInode());
-    delete ctx;
+    ctx->getClient()->statfsWithContext(ctx);
   }
 }
 
-void NfsClient::statfs(fuse_req_t req, fuse_ino_t inode) {
-  auto ctx = new RpcContextInode(this, req, FOPTYPE_STATFS, inode);
+void NfsClient::statfsWithContext(RpcContextInode* ctx) {
   int rpc_status = RPC_STATUS_ERROR;
-
+  auto inode = ctx->getInode();
   do {
     FSSTAT3args args;
     ::memset(&args, 0, sizeof(args));
     args.fsroot = inodeLookup(inode)->getFh();
 
     if (ctx->obtainConnection()) {
+      setUidGid(*ctx, false);
       rpc_status =
           rpc_nfs3_fsstat_async(ctx->getRpcCtx(), statfsCallback, &args, ctx);
+      restoreUidGid(*ctx, false);
       ctx->unlockConnection();
     }
-  } while (ctx->shouldRetryCall(rpc_status));
+  } while (shouldRetry(rpc_status, ctx));
 }
 
-namespace {
+void NfsClient::statfs(fuse_req_t req, fuse_ino_t inode) {
+  auto ctx = new RpcContextInode(this, req, FOPTYPE_STATFS, inode);
+  statfsWithContext(ctx);
+}
+
 class AccessRpcContext : public RpcContext {
  public:
   AccessRpcContext(
@@ -1486,7 +1658,6 @@ class AccessRpcContext : public RpcContext {
   fuse_ino_t inode_;
   int mask_;
 };
-} // anonymous namespace
 
 static void accessCallback(
     struct rpc_context* /* rpc */,
@@ -1497,18 +1668,17 @@ static void accessCallback(
   auto res = (ACCESS3res*)data;
   bool retry;
 
-  if (ctx->succeeded(rpc_status, res->status, retry)) {
+  if (ctx->succeeded(rpc_status, RSTATUS(res), retry)) {
     ctx->replyError(0);
   } else if (retry) {
-    ctx->getClient()->access(ctx->getReq(), ctx->getInode(), ctx->getMask());
-    delete ctx;
+    ctx->getClient()->accessWithContext(ctx);
   }
 }
 
-void NfsClient::access(fuse_req_t req, fuse_ino_t inode, int mask) {
-  auto ctx = new AccessRpcContext(this, req, FOPTYPE_ACCESS, inode, mask);
+void NfsClient::accessWithContext(AccessRpcContext* ctx) {
   int rpc_status = RPC_STATUS_ERROR;
-
+  auto inode = ctx->getInode();
+  auto mask = ctx->getMask();
   do {
     ACCESS3args args;
     ::memset(&args, 0, sizeof(args));
@@ -1522,9 +1692,16 @@ void NfsClient::access(fuse_req_t req, fuse_ino_t inode, int mask) {
     }
 
     if (ctx->obtainConnection()) {
+      setUidGid(*ctx, false);
       rpc_status =
           rpc_nfs3_access_async(ctx->getRpcCtx(), accessCallback, &args, ctx);
+      restoreUidGid(*ctx, false);
       ctx->unlockConnection();
     }
-  } while (ctx->shouldRetryCall(rpc_status));
+  } while (shouldRetry(rpc_status, ctx));
+}
+
+void NfsClient::access(fuse_req_t req, fuse_ino_t inode, int mask) {
+  auto ctx = new AccessRpcContext(this, req, FOPTYPE_ACCESS, inode, mask);
+  accessWithContext(ctx);
 }

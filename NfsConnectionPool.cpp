@@ -8,25 +8,61 @@
  */
 
 #include "NfsConnectionPool.h"
+#include <thread>
 
 NfsConnectionPool::NfsConnectionPool(
     std::vector<std::string>& urls,
+    const char* hostscript,
+    const int scriptRefreshSeconds,
     std::shared_ptr<nfusr::Logger> logger,
-    unsigned simultaneousConnections) {
+    std::shared_ptr<ClientStats> stats,
+    unsigned simultaneousConnections,
+    int nfsTimeoutMs)
+    : nUrls_(urls.size()) {
   logger_ = logger;
+  stats_ = stats;
+  if (stats_) {
+    stats_->addCallback(std::bind(
+        &NfsConnectionPool::dumpStats,
+        this,
+        std::placeholders::_1,
+        std::placeholders::_2));
+  }
   for (auto& url : urls) {
-    unconnectedUrls_.push_back(std::make_shared<std::string>(url));
+    targets_.emplace_back(std::make_shared<std::string>(url));
   }
   next_ = 0;
   liveTarget_ = simultaneousConnections;
+  nfsTimeoutMs_ = nfsTimeoutMs;
   terminateReaper_ = false;
   reaperThread_ = std::thread(&NfsConnectionPool::reaper, this);
+
+  terminateScript_ = false;
+  if (hostscript) {
+    // insert these generated connections after `urls` for nUrls_ to work
+    auto hostFromScript = runScript(hostscript);
+    if (hostFromScript.size() == 0) {
+      logger_->LOG_MSG(LOG_NOTICE, "%s generates no hosts.\n", hostscript);
+    }
+    for (auto& url : hostFromScript) {
+      targets_.emplace_back(std::make_shared<std::string>(url));
+    }
+    scriptThread_ = std::thread(
+        &NfsConnectionPool::updateTargets,
+        this,
+        hostscript,
+        scriptRefreshSeconds);
+  }
 }
 
 NfsConnectionPool::~NfsConnectionPool() {
   lock_.lock();
-  for (auto& conn : liveConnections_) {
+  while (liveConnections_.size()) {
+    auto conn = liveConnections_.back();
+    liveConnections_.pop_back();
+    lock_.unlock();
     conn->close();
+    lock_.lock();
   }
   lock_.unlock();
 
@@ -36,6 +72,30 @@ NfsConnectionPool::~NfsConnectionPool() {
   reaperCondvar_.notify_one();
 
   reaperThread_.join();
+
+  if (scriptThread_.joinable()) {
+    scriptMutex_.lock();
+    terminateScript_ = true;
+    scriptMutex_.unlock();
+    scriptCondvar_.notify_one();
+    scriptThread_.join();
+  }
+}
+
+void NfsConnectionPool::dumpStats(
+    std::shared_ptr<nfusr::Logger> logger,
+    const char* prefix) {
+  int queue_depth = 0;
+
+  {
+    std::lock_guard<std::mutex> guard(lock_);
+
+    for (auto& conn : liveConnections_) {
+      queue_depth += conn->getQueuedRequests();
+    }
+  }
+
+  logger->printf("\"%snfs-queue.count\": \"%d\"\n", prefix, queue_depth);
 }
 
 void NfsConnectionPool::reaper() {
@@ -45,9 +105,11 @@ void NfsConnectionPool::reaper() {
     reaperCondvar_.wait(lock);
 
     while (zombieConnections_.size()) {
-      auto conn = zombieConnections_.begin();
-      (*conn)->close();
-      zombieConnections_.erase(conn);
+      auto conn = zombieConnections_.back();
+      zombieConnections_.pop_back();
+      lock.unlock();
+      conn->close();
+      lock.lock();
     }
   } while (!terminateReaper_);
 }
@@ -56,33 +118,52 @@ std::shared_ptr<NfsConnection> NfsConnectionPool::get() {
   std::lock_guard<std::mutex> lock(lock_);
 
   if (liveConnections_.size() < liveTarget_) {
-    // Try to open a new connection using the set of unconnected URLS.
-    std::vector<std::shared_ptr<std::string>> sadUrls;
+    for (int pass = 0; pass < 2; pass++) {
+      // Try to open a new connection using the set of target URLS.
+      for (auto& target : targets_) {
+        // Only use this target if it has not been blacklisted,
+        // or we are on the second pass, which means we found no usable targets
+        // on the first pass.
+        if (!target.isBlacklisted() || pass > 0) {
+          if (!target.getConnected()) {
+            auto url = target.getUrl();
+            auto conn =
+                std::make_shared<NfsConnection>(logger_, stats_, nfsTimeoutMs_);
+            logger_->LOG_MSG(LOG_DEBUG, "Trying to open %s.\n", url->c_str());
+            if (!conn->open(url)) {
+              logger_->LOG_MSG(
+                  LOG_NOTICE,
+                  "Opened connection %s.\n",
+                  conn->describe().c_str());
+              if (stats_) {
+                stats_->recordConnectSuccess();
+              }
+              liveConnections_.push_back(conn);
+              target.setConnected(true);
 
-    while (unconnectedUrls_.size()) {
-      auto url = *(--unconnectedUrls_.end());
-      unconnectedUrls_.pop_back();
-
-      auto conn = std::make_shared<NfsConnection>(logger_);
-      logger_->LOG_MSG(LOG_DEBUG, "Trying to open %s.\n", url->c_str());
-      if (!conn->open(url)) {
-        logger_->LOG_MSG(
-            LOG_INFO, "Opened connection %s.\n", conn->describe().c_str());
-        liveConnections_.push_back(conn);
-        break;
-      } else {
-        logger_->LOG_MSG(
-            LOG_INFO, "Failed to open connection to %s.\n", url->c_str());
-        sadUrls.push_back(url);
+              // Log if this target is actually blacklisted and we had no choice
+              if (target.isBlacklisted()) {
+                logger_->LOG_MSG(
+                    LOG_WARNING,
+                    "Using target %s even though it is blacklisted!\n",
+                    url->c_str());
+              }
+              goto connected;
+            } else {
+              logger_->LOG_MSG(
+                  LOG_NOTICE,
+                  "Failed to open connection to %s.\n",
+                  url->c_str());
+              if (stats_) {
+                stats_->recordConnectFailure();
+              }
+            }
+          }
+        }
       }
     }
-
-    // Put back all the sad urls for next time.
-    for (auto& url : sadUrls) {
-      unconnectedUrls_.push_back(url);
-    }
   }
-
+connected:
   if (liveConnections_.size()) {
     next_ = (next_ + 1) % liveConnections_.size();
     auto conn = liveConnections_[next_];
@@ -106,8 +187,14 @@ void NfsConnectionPool::failed(std::shared_ptr<NfsConnection> conn) {
   // Remove from list of live connections.
   for (auto i = liveConnections_.begin(); i != liveConnections_.end(); ++i) {
     if (*i == conn) {
+      for (auto& target : targets_) {
+        if (target.getUrl() == conn->getUrl()) {
+          target.setConnected(false);
+          target.setBlacklisted(std::chrono::seconds(90));
+          break;
+        }
+      }
       liveConnections_.erase(i);
-      unconnectedUrls_.push_back(conn->getUrl());
 
       // We cannot directly close the connection here, because we are
       // inside the connection's ioLoop() with the lock held. Push it on
@@ -117,8 +204,79 @@ void NfsConnectionPool::failed(std::shared_ptr<NfsConnection> conn) {
       reaperCondvar_.notify_one();
       reaperMutex_.unlock();
       logger_->LOG_MSG(
-          LOG_INFO, "%s: %s.\n", __func__, conn->describe().c_str());
+          LOG_NOTICE, "%s: %s.\n", __func__, conn->describe().c_str());
       break;
     }
   }
+}
+
+static std::vector<std::string> parseHosts(const std::string& s) {
+  std::vector<std::string> result;
+  static const char* nfs_prefix = "nfs://";
+  size_t beg = s.find(nfs_prefix);
+
+  while (beg != std::string::npos) {
+    size_t space_pos = s.find_first_of(" \t\r\n", beg);
+    if (space_pos == std::string::npos) {
+      result.push_back(s.substr(beg));
+      break;
+    } else {
+      result.push_back(s.substr(beg, space_pos - beg));
+      beg = s.find(nfs_prefix, space_pos + 1);
+    }
+  }
+
+  return result;
+}
+
+std::vector<std::string> NfsConnectionPool::runScript(const char* scriptPath) {
+  std::array<char, 128> buffer;
+  std::string output;
+  FILE* pFile = popen(scriptPath, "r");
+
+  if (pFile) {
+    size_t readN = 0;
+    while (!feof(pFile)) {
+      if ((readN = fread(buffer.data(), 1, buffer.size() - 1, pFile))) {
+        buffer[readN] = '\0';
+        output += buffer.data();
+      }
+    }
+
+    pclose(pFile);
+    return parseHosts(output);
+  } else {
+    logger_->LOG_MSG(LOG_DEBUG, "popen returns null. %s failed!\n", scriptPath);
+  }
+  return std::vector<std::string>();
+}
+
+void NfsConnectionPool::updateTargets(
+    const char* hostscript,
+    const int scriptRefreshSeconds) {
+  std::unique_lock<std::mutex> scriptLock(scriptMutex_);
+
+  do {
+    logger_->LOG_MSG(
+        LOG_DEBUG,
+        "script %s is running (every %d seconds)\n",
+        hostscript,
+        scriptRefreshSeconds);
+    auto hosts = runScript(hostscript);
+
+    // update the target list
+    if (!hosts.empty()) {
+      std::lock_guard<std::mutex> lock(lock_);
+      targets_.erase(targets_.begin() + nUrls_, targets_.end());
+      for (auto& host : hosts) {
+        targets_.emplace_back(std::make_shared<std::string>(host));
+      }
+    } else {
+      logger_->LOG_MSG(LOG_NOTICE, "%s generates no hosts.\n", hostscript);
+    }
+
+    scriptCondvar_.wait_for(
+        scriptLock, std::chrono::seconds(scriptRefreshSeconds));
+
+  } while (!terminateScript_);
 }
