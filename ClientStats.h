@@ -11,6 +11,7 @@
 #include <condition_variable>
 #include <thread>
 #include <vector>
+#include <functional>
 
 #include "fuse_optype.h"
 #include "logger.h"
